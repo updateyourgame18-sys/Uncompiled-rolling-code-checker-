@@ -1,0 +1,19 @@
+App(
+    appid="rolling_code_checker",
+    name="Rolling Code Checker",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="rolling_code_checker_app",
+    requires=[
+        "gui",
+        "notification",
+        "subghz",
+    ],
+    stack_size=2 * 1024,
+    fap_category="Sub-GHz",
+    fap_icon="subghz_10px.png",
+    fap_icon_assets_symbol="rolling_code_checker",
+    fap_author="@Gitredstar",
+    fap_weburl="https://youtube.com",
+    fap_version="1.0",
+    fap_description="RX-only tool that compares two captured Sub-GHz packets to estimate whether a remote uses a fixed or rolling code.",
+)
