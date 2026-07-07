@@ -902,7 +902,7 @@ static void draw_freq_select(App* app, Canvas* canvas) {
         canvas_draw_box(canvas, 124, by, 2, th);
     }
 
-    draw_footer(canvas, "OK=Select  [!]=blocked");
+    draw_footer(canvas, "_________________");
 }
 
 // ============================================================================
@@ -935,7 +935,7 @@ static void draw_settings(App* app, Canvas* canvas) {
         canvas_set_color(canvas, ColorWhite);
     }
 
-    draw_footer(canvas, "OK=Enable  BACK=Menu");
+    draw_footer(canvas, "______________________");
 }
 
 // ============================================================================
@@ -1034,7 +1034,7 @@ static void draw_auto_freq(App* app, Canvas* canvas) {
              (unsigned long)FREQ_PRESET_COUNT);
     canvas_draw_str(canvas, 6, 44, prog);
 
-    draw_footer(canvas, "Press remote  BACK=cancel");
+    draw_footer(canvas, "__________________-");
 }
 
 // ============================================================================
@@ -1087,7 +1087,7 @@ static void draw_result(App* app, Canvas* canvas) {
     canvas_draw_str(canvas, 6, 40, proto_line);
     canvas_draw_str(canvas, 6, 50, conf_line);
 
-    draw_footer(canvas, "OK/BACK = menu");
+    draw_footer(canvas, "________________");
 }
 
 // ============================================================================
@@ -1108,7 +1108,7 @@ static void draw_about(Canvas* canvas) {
     canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignTop, "on youtube");
 
     canvas_draw_line(canvas, 2, 55, 126, 55);
-    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "BACK to return");
+    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "_________________");
 }
 
 // ============================================================================
