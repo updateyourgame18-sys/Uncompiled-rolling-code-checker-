@@ -1,17 +1,12 @@
 // rolling_code_checker.c
 // Rolling Code vs Fixed Code detector
-// GUI matches IR Raw app style: black background, white frame, BigNumbers title
+// GUI style: black background, white frame, BigNumbers title (matches IR Raw)
 //
-// RX engine: SubGhzWorker + SubGhzReceiver (the same decode pipeline the
-// built-in "Read" app uses). This replaces the earlier SubGhzTxRxWorker
-// approach, which is a peer-to-peer Flipper<->Flipper data link (fixed
-// GFSK 9.99kb framing) and can never decode a real-world OOK remote.
-//
-// Because captures now run through Flipper's actual protocol registry, the
-// verdict is grounded in Flipper's own protocol database (protocol->type ==
-// Static or Dynamic) rather than a raw-byte similarity guess. The two-press
-// "Sig 1 / Sig 2" flow is kept, now used to confirm the same protocol
-// decodes consistently and to compare payload hashes between presses.
+// RX pipeline: SubGhzWorker + SubGhzReceiver, run against subghz_protocol_registry.
+// Verdicts come from Flipper's own protocol classification (protocol->type,
+// Static/Dynamic) rather than a raw-byte guess. Two-press capture flow
+// ("Sig 1 / Sig 2") confirms the same protocol decodes on both presses and
+// compares payload hashes between them.
 
 #include <furi.h>
 #include <furi/core/string.h>
@@ -100,33 +95,26 @@ typedef enum {
 
 // Capture engine mode — mutually exclusive, persisted to SD card
 typedef enum {
-    ModeDecoder = 0,  // full protocol decode (current default behavior)
-    ModeBinRaw,       // decode known protocols; unknowns fall back to the
-                      // BinRAW catch-all decoder so they can still be classified
-    ModeReadRawOnly,  // bypass protocol decode entirely, capture raw pulse
-                      // timing directly (like the stock app's "Read RAW")
+    ModeDecoder = 0,  // full protocol decode
+    ModeBinRaw,       // decode known protocols; unmatched signals fall back to BinRAW
+    ModeReadRawOnly,  // no decode — raw pulse timing capture and compare
 } CaptureMode;
 
 #define RAW_MAX_SAMPLES  512
 #define RAW_MIN_SAMPLES  20    // need at least this many transitions to count as a real signal
 #define RAW_SILENCE_MS   150   // this much quiet after the last edge = end of this press
 
-// Two independent raw captures are almost never perfectly phase-aligned —
-// one stray noise edge at the start shifts everything after it. Instead of
-// comparing index-for-index, we search a wide range of offsets and keep the
-// best alignment score found. Deliberately throttled to a few offsets per
-// timer tick so the search takes a couple of seconds — both to let genuinely
-// deeper analysis (a much wider search range, dual-tolerance scoring below)
-// run, and so the progress screen isn't just a flash.
+// Two independent captures are rarely index-aligned — one stray edge at the
+// start of either shifts everything after it. We search a range of offsets
+// and keep the best-scoring alignment. Throttled to a few offsets per timer
+// tick so the search runs over ~2s instead of one big blocking pass.
 #define RAW_COMPARE_MAX_OFFSET      110
 #define RAW_COMPARE_TOTAL_OFFSETS   (RAW_COMPARE_MAX_OFFSET * 2 + 1)
 #define RAW_COMPARE_OFFSETS_PER_TICK 4
 
-// Squelch threshold: ignore raw pulses unless the channel's RSSI is above
-// this (matches the stock Read RAW app's own RSSI-threshold concept).
-// Without this, the CC1101's OOK envelope detector will happily report
-// noise-triggered level toggles even with no real carrier present, and
-// we'd "capture" static as if it were a signal.
+// Squelch: ignore pulses unless RSSI is above this. The CC1101's OOK
+// envelope detector reports noise-triggered toggles even with no carrier
+// present, so without a floor we'd capture static as if it were a signal.
 #define RAW_RSSI_SQUELCH_DBM  -90.0f
 
 typedef struct {
@@ -182,11 +170,10 @@ typedef struct {
     float    compare_best_score;
     uint8_t  compare_progress;
 
-    // Set from the SubGhzWorker thread's decode callback; consumed on the
-    // timer thread. Stopping the radio (subghz_worker_stop) must never be
-    // called from inside the decode callback itself, since that callback
-    // runs ON the SubGhzWorker's own thread — a thread cannot join/stop
-    // itself, and doing so trips a furi_check and crashes the device.
+    // Set from the SubGhzWorker thread's decode callback, consumed on the
+    // timer thread. subghz_worker_stop() must never be called from inside
+    // the decode callback — it runs on the worker's own thread, which can't
+    // stop/join itself.
     volatile bool pending_finish;
     volatile bool pending_auto_found;
     char auto_found_msg[48];
@@ -245,11 +232,11 @@ static void freq_str(uint32_t hz, char* out, size_t sz) {
 }
 
 // ----------------------------------------------------------------------------
-// Persistent settings — plain text file on the SD card:
+// Settings file (SD card, plain text):
 //   Decoder=<ON/OFF>
 //   BinRaw=<ON/OFF>
 //   ReadRawOnly=<ON/OFF>
-// Exactly one of these is ON at a time.
+// Exactly one is ON at a time.
 // ----------------------------------------------------------------------------
 static void settings_load(App* app) {
     app->mode = ModeDecoder; // default
@@ -298,9 +285,8 @@ static void settings_save(App* app) {
     furi_record_close(RECORD_STORAGE);
 }
 
-// Hardware-valid bands per furi_hal_subghz_is_frequency_valid —
-// these are the only ranges the CC1101 path selector handles.
-// Passing anything outside these to the device layer causes furi_crash().
+// CC1101 hardware-valid bands (furi_hal_subghz_is_frequency_valid).
+// Anything outside these ranges triggers furi_crash() at the device layer.
 static bool freq_is_hardware_valid(uint32_t hz) {
     return ((hz >= 281000000U && hz <= 361000000U) ||
             (hz >= 378000000U && hz <= 481000000U) ||
@@ -308,11 +294,9 @@ static bool freq_is_hardware_valid(uint32_t hz) {
 }
 
 // ----------------------------------------------------------------------------
-// Device power lifecycle.
-//
-// subghz_devices_get_by_name() only looks up a descriptor — it does NOT power
-// on the CC1101. subghz_devices_begin()/end() actually power the chip up and
-// down, and must bracket any use of the low-level start_async_rx/tx API.
+// Device power lifecycle. subghz_devices_get_by_name() only resolves a
+// descriptor; begin()/end() actually power the CC1101 up/down and must
+// bracket any use of the low-level start_async_rx/tx calls.
 // ----------------------------------------------------------------------------
 static void device_release(App* app) {
     if(app->began_device) {
@@ -331,9 +315,8 @@ static bool device_acquire(App* app, const SubGhzDevice* device) {
 }
 
 // ============================================================================
-// RX PIPELINE (SubGhzWorker feeds raw pulses into SubGhzReceiver, which
-// matches them against every protocol in subghz_protocol_registry — or,
-// in Read-Raw-Only mode, straight into our own raw capture buffer)
+// RX PIPELINE — SubGhzWorker feeds raw pulses into SubGhzReceiver for
+// protocol matching, or (Read-Raw-Only mode) straight into our raw buffer.
 // ============================================================================
 
 static void raw_pair_callback(void* context, bool level, uint32_t duration);
@@ -361,8 +344,8 @@ static bool subghz_rx_start(App* app, uint32_t freq) {
     snprintf(app->radio_name, sizeof(app->radio_name), "%s",
              subghz_devices_get_name(app->device));
 
-    // CRITICAL: must validate before touching hardware — passing an
-    // out-of-band frequency to the device layer calls furi_crash().
+    // Must validate before touching hardware — an out-of-band frequency
+    // triggers furi_crash() at the device layer.
     if(!freq_is_hardware_valid(freq)) {
         FURI_LOG_W(TAG, "Freq %lu outside CC1101 bands", (unsigned long)freq);
         return false;
@@ -379,17 +362,14 @@ static bool subghz_rx_start(App* app, uint32_t freq) {
     app->frequency = subghz_devices_set_frequency(app->device, freq);
 
     if(app->mode == ModeReadRawOnly) {
-        // Bypass protocol decode entirely — feed raw pulses straight into
-        // our own buffer.
+        // No protocol decode — feed pulses straight into our own buffer.
         subghz_worker_set_pair_callback(app->worker, (SubGhzWorkerPairCallback)raw_pair_callback);
         subghz_worker_set_context(app->worker, app);
     } else {
         subghz_receiver_reset(app->receiver);
         uint32_t filter = SubGhzProtocolFlag_Decodable;
         if(app->mode == ModeBinRaw) {
-            // Fall back to the BinRAW catch-all decoder for anything not
-            // matched by a named protocol, so unknown remotes still get
-            // classified.
+            // Catch-all fallback for anything not matched by a named protocol.
             filter |= SubGhzProtocolFlag_BinRAW;
         }
         subghz_receiver_set_filter(app->receiver, filter);
@@ -496,26 +476,22 @@ static void finish_compare(App* app) {
         v = VerdictAmbiguous;
         conf = 0.0f;
     } else if(strcmp(app->cap1.name, "BinRAW") == 0 && strcmp(app->cap2.name, "BinRAW") == 0) {
-        // BinRAW is a generic catch-all capture, not a real protocol family,
-        // so it has no inherent static/dynamic classification of its own —
-        // compare the payload hashes directly instead.
+        // BinRAW has no inherent static/dynamic classification of its own —
+        // compare payload hashes directly.
         v = (app->cap1.hash == app->cap2.hash) ? VerdictFixed : VerdictRolling;
         conf = 1.0f;
     } else if(strcmp(app->cap1.name, app->cap2.name) != 0) {
-        // Different protocols decoded between presses — can't cleanly
-        // compare payloads. Fall back to what the first decode's own
-        // protocol-type classification says.
+        // Different protocols on each press — fall back to the first
+        // decode's own protocol-type classification.
         v = (app->cap1.type == SubGhzProtocolTypeDynamic) ? VerdictRolling : VerdictFixed;
         conf = 0.5f;
     } else if(app->cap1.type == SubGhzProtocolTypeDynamic) {
-        // Flipper's protocol database already flags this protocol family
-        // (KeeLoq, Security+, Nice FloR-S, etc) as a rolling/dynamic code.
+        // Known dynamic-code family (KeeLoq, Security+, Nice FloR-S, etc).
         v = VerdictRolling;
         conf = (app->cap1.hash != app->cap2.hash) ? 1.0f : 0.85f;
     } else {
-        // Static-family protocol (Princeton, Came, Nice Flo, etc). Confirm
-        // the payload was actually identical between presses, which it
-        // should be for a real fixed-code remote.
+        // Static-code family (Princeton, Came, Nice Flo, etc). Confirm the
+        // payload actually matched between presses.
         v = (app->cap1.hash == app->cap2.hash) ? VerdictFixed : VerdictAmbiguous;
         conf = (app->cap1.hash == app->cap2.hash) ? 1.0f : 0.4f;
     }
@@ -523,11 +499,9 @@ static void finish_compare(App* app) {
     finish_result(app, v, conf);
 }
 
-// Raw-timing similarity between two captures AT A GIVEN ALIGNMENT OFFSET.
-// Two independently-captured bursts of the same real signal are rarely
-// index-aligned (a stray noise edge at the start of either capture shifts
-// everything after it), so this is evaluated across a range of offsets by
-// the Comparing scene below, and the best-scoring offset wins.
+// Timing similarity between two captures at a given alignment offset.
+// Evaluated across a range of offsets by the Comparing scene; best-scoring
+// offset wins.
 static float raw_similarity_at_offset(const RawCapture* a, const RawCapture* b, int offset) {
     int start_a = offset < 0 ? -offset : 0;
     int start_b = offset > 0 ? offset : 0;
@@ -556,24 +530,20 @@ static float raw_similarity_at_offset(const RawCapture* a, const RawCapture* b, 
     uint16_t mx = a->count > b->count ? a->count : b->count;
     float loose_score  = (float)close_loose / (float)len;
     float strict_score = (float)close_strict / (float)len;
-    // Weight toward the strict match — a good alignment should mostly agree
-    // tightly, not just "roughly" agree, or noise could fake a high score.
+    // Weight toward strict matches — rough agreement alone can be noise.
     float sample_score = loose_score * 0.3f + strict_score * 0.7f;
     float coverage_score = (float)len / (float)mx;
     return sample_score * 0.8f + coverage_score * 0.2f;
 }
 
-// Raw pulse capture callback for Read-Raw-Only mode. Runs on the
-// SubGhzWorker thread — only touches plain data fields here, never radio
-// control (same rule as the decode callback below).
+// Raw pulse capture for Read-Raw-Only mode. Runs on the SubGhzWorker
+// thread — data fields only, no radio control (see decode callback below).
 static void raw_pair_callback(void* context, bool level, uint32_t duration) {
     App* app = context;
     if(!app || !app->armed) return;
     if(app->scene != SceneCapture1 && app->scene != SceneCapture2) return;
 
-    // Squelch: don't record pulses unless there's actually a signal present.
-    // Without this the CC1101's OOK envelope detector will report
-    // noise-triggered level toggles even with nothing transmitting.
+    // Squelch — reject noise-triggered toggles when nothing is transmitting.
     if(app->last_rssi < RAW_RSSI_SQUELCH_DBM) return;
 
     RawCapture* rc = (app->scene == SceneCapture1) ? &app->raw1 : &app->raw2;
@@ -585,8 +555,8 @@ static void raw_pair_callback(void* context, bool level, uint32_t duration) {
 }
 
 // ============================================================================
-// DECODE CALLBACK — fires from the SubGhzWorker thread whenever a captured
-// pulse train matches a protocol in subghz_protocol_registry.
+// DECODE CALLBACK — fires on the SubGhzWorker thread when a pulse train
+// matches a protocol in subghz_protocol_registry.
 // ============================================================================
 
 static void on_subghz_decode(SubGhzReceiver* receiver, SubGhzProtocolDecoderBase* decoder_base, void* context) {
@@ -596,7 +566,7 @@ static void on_subghz_decode(SubGhzReceiver* receiver, SubGhzProtocolDecoderBase
 
     const SubGhzProtocol* protocol = decoder_base->protocol;
 
-    // Auto freq: any successful decode means "there's a remote on this freq"
+    // Auto freq: any decode at all means there's a remote on this frequency.
     if(app->scene == SceneAutoFreq) {
         char fb[24];
         freq_str(app->frequency, fb, sizeof(fb));
@@ -625,10 +595,8 @@ static void on_subghz_decode(SubGhzReceiver* receiver, SubGhzProtocolDecoderBase
             app->deadline = furi_get_tick() + furi_ms_to_ticks(CAPTURE_TIMEOUT_MS);
             set_status(app, "Got sig 1 — arm for sig 2", 2000);
         } else {
-            // Don't call finish_compare()/subghz_rx_stop() here — this
-            // callback runs on the SubGhzWorker thread and stopping the
-            // worker from inside itself crashes the device. Defer to the
-            // timer thread instead.
+            // Deferred to the timer thread — subghz_rx_stop() can't run
+            // from inside this callback (see App.pending_finish above).
             app->pending_finish = true;
         }
         app_redraw(app);
@@ -682,8 +650,8 @@ static void process_timeouts(App* app) {
     }
 
     if((app->scene == SceneCapture1 || app->scene == SceneCapture2) && app->armed) {
-        // Read-Raw-Only mode: no decode event tells us a press finished, so
-        // detect it as a gap of silence after the last pulse edge instead.
+        // Read-Raw-Only: no decode event marks end of a press, so use a
+        // gap of silence after the last edge instead.
         if(app->mode == ModeReadRawOnly) {
             if(app->device) {
                 app->last_rssi = subghz_devices_get_rssi(app->device);
@@ -902,7 +870,7 @@ static void draw_freq_select(App* app, Canvas* canvas) {
         canvas_draw_box(canvas, 124, by, 2, th);
     }
 
-    draw_footer(canvas, "_________________");
+    draw_footer(canvas, "OK=Select  [!]=blocked");
 }
 
 // ============================================================================
@@ -935,7 +903,7 @@ static void draw_settings(App* app, Canvas* canvas) {
         canvas_set_color(canvas, ColorWhite);
     }
 
-    draw_footer(canvas, "______________________");
+    draw_footer(canvas, "OK=Enable  BACK=Menu");
 }
 
 // ============================================================================
@@ -1034,7 +1002,7 @@ static void draw_auto_freq(App* app, Canvas* canvas) {
              (unsigned long)FREQ_PRESET_COUNT);
     canvas_draw_str(canvas, 6, 44, prog);
 
-    draw_footer(canvas, "__________________-");
+    draw_footer(canvas, "Press remote  BACK=cancel");
 }
 
 // ============================================================================
@@ -1087,7 +1055,9 @@ static void draw_result(App* app, Canvas* canvas) {
     canvas_draw_str(canvas, 6, 40, proto_line);
     canvas_draw_str(canvas, 6, 50, conf_line);
 
-    draw_footer(canvas, "________________");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 4, 63, AlignLeft, AlignBottom, "BACK=Menu");
+    canvas_draw_str_aligned(canvas, 124, 63, AlignRight, AlignBottom, "Re-scan >");
 }
 
 // ============================================================================
@@ -1108,7 +1078,7 @@ static void draw_about(Canvas* canvas) {
     canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignTop, "on youtube");
 
     canvas_draw_line(canvas, 2, 55, 126, 55);
-    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "_________________");
+    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "BACK to return");
 }
 
 // ============================================================================
@@ -1259,8 +1229,7 @@ static void input_cb(InputEvent* ev, void* ctx) {
             app_redraw(app);
             return;
         }
-        // Capture is auto-armed on entry / after sig 1; OK re-arms if
-        // somehow disarmed (kept for parity with the original controls).
+        // OK arms the capture window.
         if(ev->key == InputKeyOk && !app->armed) {
             subghz_receiver_reset(app->receiver);
             app->last_rssi = -120.0f; // squelch closed until the next RSSI poll
@@ -1297,6 +1266,10 @@ static void input_cb(InputEvent* ev, void* ctx) {
         if(ev->key == InputKeyBack || ev->key == InputKeyOk) {
             go_menu(app);
             app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyRight) {
+            start_compare(app);
         }
         return;
     }
