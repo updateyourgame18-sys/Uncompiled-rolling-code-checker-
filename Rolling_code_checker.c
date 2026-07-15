@@ -4,9 +4,9 @@
 //
 // RX pipeline: SubGhzWorker + SubGhzReceiver, run against subghz_protocol_registry.
 // Verdicts come from Flipper's own protocol classification (protocol->type,
-// Static/Dynamic) rather than a raw-byte guess. Two-press capture flow
-// ("Sig 1 / Sig 2") confirms the same protocol decodes on both presses and
-// compares payload hashes between them.
+// Static/Dynamic) rather than a raw-byte guess. Capture flow takes N presses
+// (configurable, 2-10) and checks whether the same protocol decodes each
+// time with matching payload data.
 
 #include <furi.h>
 #include <furi/core/string.h>
@@ -23,14 +23,18 @@
 #include <subghz/devices/preset.h>
 #include <subghz/devices/cc1101_int/cc1101_int_interconnect.h>
 #include <storage/storage.h>
+#include <furi_hal_rtc.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
 #define TAG "RCC"
 
-#define SETTINGS_DIR  EXT_PATH("apps_data/rolling_code_checker")
-#define SETTINGS_PATH EXT_PATH("apps_data/rolling_code_checker/settings.txt")
+#define SETTINGS_DIR       EXT_PATH("apps_data/rolling_code_checker")
+#define SETTINGS_PATH       EXT_PATH("apps_data/rolling_code_checker/settings.txt")
+#define WATCHDOG_REF_PATH   EXT_PATH("apps_data/rolling_code_checker/watchdog_ref.txt")
+#define WATCHDOG_LOG_PATH   EXT_PATH("apps_data/rolling_code_checker/watchdog_log.txt")
+#define IDENTIFIER_TABLE_PATH EXT_PATH("apps_data/rolling_code_checker/identifiers.txt")
 
 extern const SubGhzProtocolRegistry subghz_protocol_registry;
 
@@ -39,11 +43,14 @@ extern const SubGhzProtocolRegistry subghz_protocol_registry;
 // ============================================================================
 
 #define CAPTURE_TIMEOUT_MS  8000  // 8 s to press remote
-#define AUTO_FREQ_DWELL_MS  800   // time to listen on each auto freq
 #define TIMER_PERIOD_MS     40    // ~25 Hz UI refresh
 
 #define DEFAULT_FREQ_HZ 433920000U
 
+#define MIN_CAPTURES 2
+#define MAX_CAPTURES 10
+
+// Manual frequency picker — short curated list.
 static const uint32_t kFreqPresets[] = {
     300000000U,
     315000000U,
@@ -56,6 +63,11 @@ static const uint32_t kFreqPresets[] = {
 };
 #define FREQ_PRESET_COUNT (sizeof(kFreqPresets) / sizeof(kFreqPresets[0]))
 
+// Auto Find now shares the same preset list as manual Set Frequency
+// (kFreqPresets, above), so the on-screen strip always matches what's
+// actually being scanned/tuned.
+#define AUTO_FREQ_DWELL_MS  150 // per-frequency RSSI dwell
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -63,13 +75,16 @@ static const uint32_t kFreqPresets[] = {
 typedef enum {
     SceneMenu,
     SceneFreqSelect,
-    SceneCapture1,
-    SceneCapture2,
+    SceneCapturing,
     SceneComparing,
     SceneResult,
     SceneAutoFreq,
     SceneSettings,
     SceneAbout,
+    SceneWatchdogMenu,
+    SceneWatchdogLearn,
+    SceneWatching,
+    SceneWatchdogLog,
 } Scene;
 
 typedef enum {
@@ -87,6 +102,7 @@ typedef enum {
     MenuCompare = 0,
     MenuAutoFreq,
     MenuFreqSelect,
+    MenuWatchdog,
     MenuSettings,
     MenuRadioToggle,
     MenuAbout,
@@ -98,7 +114,9 @@ typedef enum {
     ModeDecoder = 0,  // full protocol decode
     ModeBinRaw,       // decode known protocols; unmatched signals fall back to BinRAW
     ModeReadRawOnly,  // no decode — raw pulse timing capture and compare
+    ModeIdentifier,   // raw capture + measured Te/edge-count signature lookup
 } CaptureMode;
+#define CAPTURE_MODE_COUNT 4
 
 #define RAW_MAX_SAMPLES  512
 #define RAW_MIN_SAMPLES  20    // need at least this many transitions to count as a real signal
@@ -106,11 +124,13 @@ typedef enum {
 
 // Two independent captures are rarely index-aligned — one stray edge at the
 // start of either shifts everything after it. We search a range of offsets
-// and keep the best-scoring alignment. Throttled to a few offsets per timer
-// tick so the search runs over ~2s instead of one big blocking pass.
-#define RAW_COMPARE_MAX_OFFSET      110
-#define RAW_COMPARE_TOTAL_OFFSETS   (RAW_COMPARE_MAX_OFFSET * 2 + 1)
-#define RAW_COMPARE_OFFSETS_PER_TICK 4
+// and keep the best-scoring alignment. This window stays wide regardless of
+// how many captures were requested (shrinking it to keep total time down
+// caused real matches to be missed at higher capture counts) — instead we
+// scale how many offsets are processed per timer tick, so more captures
+// take proportionally longer rather than getting less accurate.
+#define RAW_COMPARE_MAX_OFFSET       90
+#define RAW_COMPARE_TARGET_TICKS     55 // ~2.2s per-pair budget at the baseline (2 captures)
 
 // Squelch: ignore pulses unless RSSI is above this. The CC1101's OOK
 // envelope detector reports noise-triggered toggles even with no carrier
@@ -135,7 +155,6 @@ typedef struct {
 typedef struct {
     // Core state
     Scene    scene;
-    Scene    prev_scene;
     bool     running;
 
     // Radio
@@ -151,23 +170,32 @@ typedef struct {
     SubGhzReceiver*    receiver;
     SubGhzWorker*      worker;
 
-    // Capture
-    CaptureResult cap1;
-    CaptureResult cap2;
-    RawCapture    raw1;
-    RawCapture    raw2;
-    float         last_rssi; // polled each tick while capturing in raw mode
-    bool    armed;
-    uint32_t deadline;
+    // Capture — capture_count presses requested, capture_index tracks progress
+    CaptureResult caps[MAX_CAPTURES];
+    RawCapture*   raws;          // allocated for capture_count entries in raw mode
+    uint8_t       capture_count;
+    uint8_t       capture_index;
+    float         last_rssi;     // polled each tick while armed
+    float         meter_boost;   // signal-ball pulse envelope, decays each tick
+    bool          armed;
+    uint32_t      deadline;
 
     // Settings
     CaptureMode mode;
     uint8_t     settings_sel;
 
-    // Raw-mode alignment search ("Comparing...") state
+    // Raw-mode alignment search ("Comparing...") state — walks capture_count-1
+    // pairs (each vs raws[0]), tracking the worst (minimum) best-alignment
+    // score seen across all pairs.
+    uint16_t compare_pair_idx;
+    uint16_t compare_pair_count;
     int16_t  compare_offset;
-    uint16_t compare_done;
-    float    compare_best_score;
+    int16_t  compare_max_offset;
+    uint16_t compare_offsets_per_tick; // scales up with more captures, keeps window wide
+    uint16_t compare_done_total;
+    uint16_t compare_total_all;
+    float    compare_pair_best;
+    float    compare_min_score;
     uint8_t  compare_progress;
 
     // Set from the SubGhzWorker thread's decode callback, consumed on the
@@ -176,7 +204,36 @@ typedef struct {
     // stop/join itself.
     volatile bool pending_finish;
     volatile bool pending_auto_found;
+    volatile bool pending_watchdog_learned;
+    volatile bool pending_watchdog_event;
     char auto_found_msg[48];
+    char pending_watchdog_event_name[24];
+    bool pending_watchdog_event_known;
+
+    // Forces the decode pipeline (ignoring app->mode) for scenes that need
+    // a protocol name/hash regardless of the user's Read-Raw/Identifier
+    // setting — Watchdog learn/watch always need this.
+    bool force_decode_mode;
+
+    // Watchdog — a learned reference signature, continuous monitoring
+    // against it, and a simple append-only event log on the SD card.
+    bool     watch_has_ref;
+    char     watch_ref_name[24];
+    uint8_t  watch_ref_type;
+    uint8_t  watch_ref_hash;
+    uint32_t watch_freq;
+    uint32_t watch_known_count;
+    uint32_t watch_unknown_count;
+    uint8_t  watchdog_menu_sel;
+    char     log_lines[4][48];
+    uint8_t  log_line_count;
+
+    // Identifier — measured characteristics from a raw capture, checked
+    // against a user-editable signature table on the SD card.
+    uint32_t ident_te_us;
+    uint16_t ident_edge_count;
+    char     ident_match_name[24];
+    bool     ident_has_match;
 
     // Result
     Verdict  verdict;
@@ -188,10 +245,11 @@ typedef struct {
     // Freq select
     uint8_t  freq_sel;
 
-    // Auto freq
-    uint32_t auto_idx;
+    // Auto freq (RSSI sweep + manual left/right override)
+    uint8_t  auto_preset_idx; // index into kFreqPresets currently tuned
+    bool     auto_manual;     // true once Left/Right takes over from auto-hop
     uint32_t auto_deadline;
-    bool     auto_found;
+    uint32_t pre_scan_freq;   // restored on Back (cancel without locking)
 
     // Ticker for animated dots
     uint32_t tick;
@@ -236,25 +294,37 @@ static void freq_str(uint32_t hz, char* out, size_t sz) {
 //   Decoder=<ON/OFF>
 //   BinRaw=<ON/OFF>
 //   ReadRawOnly=<ON/OFF>
-// Exactly one is ON at a time.
+//   Captures=<2-10>
+// Exactly one mode is ON at a time.
 // ----------------------------------------------------------------------------
 static void settings_load(App* app) {
-    app->mode = ModeDecoder; // default
+    app->mode = ModeDecoder;
+    app->capture_count = MIN_CAPTURES;
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
 
     if(storage_file_open(file, SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        char buf[128];
+        char buf[160];
         uint16_t len = storage_file_read(file, buf, sizeof(buf) - 1);
         buf[len < sizeof(buf) ? len : sizeof(buf) - 1] = '\0';
 
-        if(strstr(buf, "ReadRawOnly=ON")) {
+        if(strstr(buf, "Identifier=ON")) {
+            app->mode = ModeIdentifier;
+        } else if(strstr(buf, "ReadRawOnly=ON")) {
             app->mode = ModeReadRawOnly;
         } else if(strstr(buf, "BinRaw=ON")) {
             app->mode = ModeBinRaw;
         } else {
             app->mode = ModeDecoder;
+        }
+
+        char* p = strstr(buf, "Captures=");
+        if(p) {
+            int n = atoi(p + strlen("Captures="));
+            if(n < MIN_CAPTURES) n = MIN_CAPTURES;
+            if(n > MAX_CAPTURES) n = MAX_CAPTURES;
+            app->capture_count = (uint8_t)n;
         }
     }
 
@@ -269,17 +339,194 @@ static void settings_save(App* app) {
 
     File* file = storage_file_alloc(storage);
     if(storage_file_open(file, SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        char buf[128];
+        char buf[192];
         int n = snprintf(
             buf,
             sizeof(buf),
-            "Decoder=%s\nBinRaw=%s\nReadRawOnly=%s\n",
+            "Decoder=%s\nBinRaw=%s\nReadRawOnly=%s\nIdentifier=%s\nCaptures=%u\n",
             app->mode == ModeDecoder ? "ON" : "OFF",
             app->mode == ModeBinRaw ? "ON" : "OFF",
-            app->mode == ModeReadRawOnly ? "ON" : "OFF");
+            app->mode == ModeReadRawOnly ? "ON" : "OFF",
+            app->mode == ModeIdentifier ? "ON" : "OFF",
+            (unsigned)app->capture_count);
         storage_file_write(file, buf, n);
     }
 
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+// ----------------------------------------------------------------------------
+// Watchdog reference (SD card, plain text):
+//   Name=<protocol name>
+//   Type=<0/1/2>   (SubGhzProtocolType)
+//   Hash=<0-255>
+//   Freq=<Hz>
+// ----------------------------------------------------------------------------
+static void watchdog_load_ref(App* app) {
+    app->watch_has_ref = false;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, WATCHDOG_REF_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[128];
+        uint16_t len = storage_file_read(file, buf, sizeof(buf) - 1);
+        buf[len < sizeof(buf) ? len : sizeof(buf) - 1] = '\0';
+
+        char* p = strstr(buf, "Name=");
+        if(p) {
+            p += 5;
+            char* end = strchr(p, '\n');
+            size_t l = end ? (size_t)(end - p) : strlen(p);
+            if(l >= sizeof(app->watch_ref_name)) l = sizeof(app->watch_ref_name) - 1;
+            memcpy(app->watch_ref_name, p, l);
+            app->watch_ref_name[l] = '\0';
+            app->watch_has_ref = true;
+        }
+        p = strstr(buf, "Type=");
+        if(p) app->watch_ref_type = (uint8_t)atoi(p + 5);
+        p = strstr(buf, "Hash=");
+        if(p) app->watch_ref_hash = (uint8_t)atoi(p + 5);
+        p = strstr(buf, "Freq=");
+        if(p) app->watch_freq = (uint32_t)atoi(p + 5);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void watchdog_save_ref(App* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(storage, SETTINGS_DIR);
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, WATCHDOG_REF_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buf[128];
+        int n = snprintf(
+            buf, sizeof(buf), "Name=%s\nType=%u\nHash=%u\nFreq=%lu\n",
+            app->watch_ref_name, (unsigned)app->watch_ref_type,
+            (unsigned)app->watch_ref_hash, (unsigned long)app->watch_freq);
+        storage_file_write(file, buf, n);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void watchdog_log_event(bool known, const char* name) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(storage, SETTINGS_DIR);
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, WATCHDOG_LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        DateTime dt;
+        furi_hal_rtc_get_datetime(&dt);
+        char line[64];
+        int n = snprintf(
+            line, sizeof(line), "%04u-%02u-%02u %02u:%02u:%02u,%s,%s\n",
+            dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+            known ? "KNOWN" : "UNKNOWN", name);
+        storage_file_write(file, line, n);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+// Loads the last few lines of the watchdog log for the log-viewer screen.
+// Seeks near the end of the file rather than reading it all, so this stays
+// cheap regardless of how large the log has grown.
+static void watchdog_log_load_recent(App* app) {
+    app->log_line_count = 0;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, WATCHDOG_LOG_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint64_t size = storage_file_size(file);
+        uint32_t seek_from = size > 1024 ? (uint32_t)(size - 1024) : 0;
+        storage_file_seek(file, seek_from, true);
+
+        char buf[1025];
+        uint16_t len = storage_file_read(file, buf, sizeof(buf) - 1);
+        buf[len] = '\0';
+
+        uint8_t n = 0;
+        char* p = buf;
+        while(*p) {
+            char* nl = strchr(p, '\n');
+            if(nl) *nl = '\0';
+            if(*p) {
+                if(n < 4) {
+                    snprintf(app->log_lines[n], sizeof(app->log_lines[n]), "%.47s", p);
+                    n++;
+                } else {
+                    memmove(app->log_lines[0], app->log_lines[1], sizeof(app->log_lines[0]) * 3);
+                    snprintf(app->log_lines[3], sizeof(app->log_lines[3]), "%.47s", p);
+                }
+            }
+            if(!nl) break;
+            p = nl + 1;
+        }
+        app->log_line_count = n;
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void watchdog_log_clear(void) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_common_remove(storage, WATCHDOG_LOG_PATH);
+    furi_record_close(RECORD_STORAGE);
+}
+
+// ----------------------------------------------------------------------------
+// Identifier — measured Te (shortest recurring pulse width) and edge count
+// from a raw capture, checked against a user-editable signature table:
+//   Name,MinTeUs,MaxTeUs,MinEdges,MaxEdges
+// one entry per line. Ships empty — this app does not include or claim any
+// built-in database of real-world protocol signatures.
+// ----------------------------------------------------------------------------
+static void identifier_measure(App* app, const RawCapture* rc) {
+    app->ident_edge_count = rc->count;
+    app->ident_te_us = 0;
+
+    uint32_t min_dur = 0xFFFFFFFFU;
+    for(uint16_t i = 0; i < rc->count; i++) {
+        uint32_t d = (uint32_t)(rc->timing[i] < 0 ? -rc->timing[i] : rc->timing[i]);
+        if(d > 20 && d < min_dur) min_dur = d; // ignore near-zero glitches
+    }
+    if(min_dur != 0xFFFFFFFFU) app->ident_te_us = min_dur;
+}
+
+static void identifier_lookup(App* app) {
+    app->ident_has_match = false;
+    app->ident_match_name[0] = '\0';
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, IDENTIFIER_TABLE_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[1025];
+        uint16_t len = storage_file_read(file, buf, sizeof(buf) - 1);
+        buf[len] = '\0';
+
+        char* p = buf;
+        while(*p && !app->ident_has_match) {
+            char* nl = strchr(p, '\n');
+            if(nl) *nl = '\0';
+
+            char name[24] = {0};
+            uint32_t min_te, max_te;
+            uint32_t min_edges, max_edges;
+            if(*p && sscanf(p, "%23[^,],%lu,%lu,%lu,%lu", name, &min_te, &max_te, &min_edges, &max_edges) == 5) {
+                if(app->ident_te_us >= min_te && app->ident_te_us <= max_te &&
+                   app->ident_edge_count >= min_edges && app->ident_edge_count <= max_edges) {
+                    snprintf(app->ident_match_name, sizeof(app->ident_match_name), "%s", name);
+                    app->ident_has_match = true;
+                }
+            }
+
+            if(!nl) break;
+            p = nl + 1;
+        }
+    }
     storage_file_close(file);
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
@@ -358,17 +605,22 @@ static bool subghz_rx_start(App* app, uint32_t freq) {
     }
 
     subghz_devices_reset(app->device);
+    furi_delay_ms(5); // let the CC1101 settle before reconfiguring — rapid
+                       // back-to-back reset/reload cycles across scans can
+                       // otherwise leave it in a half-initialized state
     subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
     app->frequency = subghz_devices_set_frequency(app->device, freq);
 
-    if(app->mode == ModeReadRawOnly) {
+    bool use_raw_pipeline = (app->mode == ModeReadRawOnly || app->mode == ModeIdentifier) && !app->force_decode_mode;
+
+    if(use_raw_pipeline) {
         // No protocol decode — feed pulses straight into our own buffer.
         subghz_worker_set_pair_callback(app->worker, (SubGhzWorkerPairCallback)raw_pair_callback);
         subghz_worker_set_context(app->worker, app);
     } else {
         subghz_receiver_reset(app->receiver);
         uint32_t filter = SubGhzProtocolFlag_Decodable;
-        if(app->mode == ModeBinRaw) {
+        if(app->mode == ModeBinRaw || app->force_decode_mode) {
             // Catch-all fallback for anything not matched by a named protocol.
             filter |= SubGhzProtocolFlag_BinRAW;
         }
@@ -395,13 +647,24 @@ static void go_menu(App* app) {
 }
 
 static void reset_capture(App* app) {
-    memset(&app->cap1, 0, sizeof(app->cap1));
-    memset(&app->cap2, 0, sizeof(app->cap2));
-    memset(&app->raw1, 0, sizeof(app->raw1));
-    memset(&app->raw2, 0, sizeof(app->raw2));
+    memset(app->caps, 0, sizeof(app->caps));
+
+    if(app->raws) {
+        free(app->raws);
+        app->raws = NULL;
+    }
+    if(app->mode == ModeReadRawOnly || app->mode == ModeIdentifier) {
+        app->raws = malloc(sizeof(RawCapture) * app->capture_count);
+        if(app->raws) {
+            memset(app->raws, 0, sizeof(RawCapture) * app->capture_count);
+        }
+    }
+
+    app->capture_index = 0;
     app->confidence = 0.0f;
     app->verdict = VerdictNone;
     app->armed = false;
+    app->meter_boost = 0.0f;
 }
 
 static void start_compare(App* app) {
@@ -415,6 +678,14 @@ static void start_compare(App* app) {
         return;
     }
 
+    if((app->mode == ModeReadRawOnly || app->mode == ModeIdentifier) && !app->raws) {
+        set_status(app, "Out of memory", 2000);
+        app->verdict = VerdictFreqBlocked;
+        app->scene   = SceneResult;
+        app_redraw(app);
+        return;
+    }
+
     if(!subghz_rx_start(app, app->frequency)) {
         set_status(app, "Radio start failed", 2000);
         app->verdict = VerdictFreqBlocked;
@@ -422,30 +693,31 @@ static void start_compare(App* app) {
         app_redraw(app);
         return;
     }
-    app->scene = SceneCapture1;
+    app->scene = SceneCapturing;
     set_status(app, "Press remote when armed", 2000);
     app_redraw(app);
 }
 
+// Continuous RSSI sweep across the preset list — same idea as the stock
+// Frequency Analyzer. No decode needed, so no worker/receiver involved.
 static void start_auto_freq(App* app) {
     reset_capture(app);
-    app->auto_idx   = 0;
-    app->auto_found = false;
 
-    // Find first hardware-valid preset to start on
-    while(app->auto_idx < FREQ_PRESET_COUNT &&
-          !freq_is_hardware_valid(kFreqPresets[app->auto_idx])) {
-        app->auto_idx++;
+    app->pre_scan_freq = app->frequency;
+    app->auto_manual   = false;
+
+    // Uses the same short preset list as manual Set Frequency, so the
+    // left/right strip on screen matches what's actually being scanned.
+    app->auto_preset_idx = 0;
+    for(uint8_t i = 0; i < FREQ_PRESET_COUNT; i++) {
+        if(kFreqPresets[i] == app->frequency) { app->auto_preset_idx = i; break; }
     }
 
-    if(app->auto_idx >= FREQ_PRESET_COUNT) {
-        set_status(app, "No valid freqs for region", 2500);
-        go_menu(app);
-        app_redraw(app);
-        return;
-    }
-
-    if(!subghz_rx_start(app, kFreqPresets[app->auto_idx])) {
+    // Reuse the same begin/reset/preset/start_async_rx sequence captures
+    // use — proven stable — rather than driving the device state machine
+    // by hand. The decode/raw pair callbacks both no-op outside of
+    // SceneCapturing, so this is safe to use purely for its RSSI side effect.
+    if(!subghz_rx_start(app, kFreqPresets[app->auto_preset_idx])) {
         set_status(app, "No radio device", 2500);
         go_menu(app);
         app_redraw(app);
@@ -454,6 +726,46 @@ static void start_auto_freq(App* app) {
 
     app->auto_deadline = furi_get_tick() + furi_ms_to_ticks(AUTO_FREQ_DWELL_MS);
     app->scene = SceneAutoFreq;
+    app_redraw(app);
+}
+
+static void start_watchdog_learn(App* app) {
+    reset_capture(app);
+    app->force_decode_mode = true;
+
+    if(!freq_is_hardware_valid(app->frequency)) {
+        set_status(app, "Freq blocked — pick another", 2500);
+        app->force_decode_mode = false;
+        return;
+    }
+    if(!subghz_rx_start(app, app->frequency)) {
+        set_status(app, "Radio start failed", 2000);
+        app->force_decode_mode = false;
+        return;
+    }
+
+    app->scene = SceneWatchdogLearn;
+    app_redraw(app);
+}
+
+static void start_watching(App* app) {
+    if(!app->watch_has_ref) {
+        set_status(app, "Learn a remote first!", 1800);
+        return;
+    }
+
+    reset_capture(app);
+    app->force_decode_mode = true;
+    app->watch_known_count = 0;
+    app->watch_unknown_count = 0;
+
+    if(!subghz_rx_start(app, app->watch_freq)) {
+        set_status(app, "Radio start failed", 2000);
+        app->force_decode_mode = false;
+        return;
+    }
+
+    app->scene = SceneWatching;
     app_redraw(app);
 }
 
@@ -467,36 +779,53 @@ static void finish_result(App* app, Verdict v, float conf) {
     app_redraw(app);
 }
 
-// Compare the two captured presses and decide fixed vs. rolling.
+// Compare all captured presses and decide fixed vs. rolling.
 static void finish_compare(App* app) {
-    Verdict v;
-    float conf;
+    uint8_t n = app->capture_count;
 
-    if(!app->cap1.valid || !app->cap2.valid) {
-        v = VerdictAmbiguous;
-        conf = 0.0f;
-    } else if(strcmp(app->cap1.name, "BinRAW") == 0 && strcmp(app->cap2.name, "BinRAW") == 0) {
-        // BinRAW has no inherent static/dynamic classification of its own —
-        // compare payload hashes directly.
-        v = (app->cap1.hash == app->cap2.hash) ? VerdictFixed : VerdictRolling;
-        conf = 1.0f;
-    } else if(strcmp(app->cap1.name, app->cap2.name) != 0) {
-        // Different protocols on each press — fall back to the first
-        // decode's own protocol-type classification.
-        v = (app->cap1.type == SubGhzProtocolTypeDynamic) ? VerdictRolling : VerdictFixed;
-        conf = 0.5f;
-    } else if(app->cap1.type == SubGhzProtocolTypeDynamic) {
-        // Known dynamic-code family (KeeLoq, Security+, Nice FloR-S, etc).
-        v = VerdictRolling;
-        conf = (app->cap1.hash != app->cap2.hash) ? 1.0f : 0.85f;
-    } else {
-        // Static-code family (Princeton, Came, Nice Flo, etc). Confirm the
-        // payload actually matched between presses.
-        v = (app->cap1.hash == app->cap2.hash) ? VerdictFixed : VerdictAmbiguous;
-        conf = (app->cap1.hash == app->cap2.hash) ? 1.0f : 0.4f;
+    for(uint8_t i = 0; i < n; i++) {
+        if(!app->caps[i].valid) {
+            finish_result(app, VerdictAmbiguous, 0.0f);
+            return;
+        }
     }
 
-    finish_result(app, v, conf);
+    bool same_name = true;
+    for(uint8_t i = 1; i < n; i++) {
+        if(strcmp(app->caps[i].name, app->caps[0].name) != 0) {
+            same_name = false;
+            break;
+        }
+    }
+
+    if(!same_name) {
+        // Different protocols across presses — fall back to the first
+        // decode's own protocol-type classification.
+        Verdict v = (app->caps[0].type == SubGhzProtocolTypeDynamic) ? VerdictRolling : VerdictFixed;
+        finish_result(app, v, 0.5f);
+        return;
+    }
+
+    uint8_t matches = 0;
+    for(uint8_t i = 1; i < n; i++) {
+        if(app->caps[i].hash == app->caps[0].hash) matches++;
+    }
+    bool all_match = (matches == n - 1);
+    float match_frac = (n > 1) ? (float)matches / (float)(n - 1) : 1.0f;
+    bool is_binraw = (strcmp(app->caps[0].name, "BinRAW") == 0);
+
+    if(is_binraw) {
+        // BinRAW has no inherent static/dynamic classification of its own —
+        // compare payload hashes directly.
+        finish_result(app, all_match ? VerdictFixed : VerdictRolling, 1.0f);
+    } else if(app->caps[0].type == SubGhzProtocolTypeDynamic) {
+        // Known dynamic-code family (KeeLoq, Security+, Nice FloR-S, etc).
+        finish_result(app, VerdictRolling, all_match ? 0.85f : 1.0f);
+    } else {
+        // Static-code family (Princeton, Came, Nice Flo, etc).
+        finish_result(app, all_match ? VerdictFixed : VerdictAmbiguous,
+                      all_match ? 1.0f : (0.4f + 0.5f * match_frac));
+    }
 }
 
 // Timing similarity between two captures at a given alignment offset.
@@ -541,12 +870,13 @@ static float raw_similarity_at_offset(const RawCapture* a, const RawCapture* b, 
 static void raw_pair_callback(void* context, bool level, uint32_t duration) {
     App* app = context;
     if(!app || !app->armed) return;
-    if(app->scene != SceneCapture1 && app->scene != SceneCapture2) return;
+    if(app->scene != SceneCapturing) return;
+    if(!app->raws || app->capture_index >= app->capture_count) return;
 
     // Squelch — reject noise-triggered toggles when nothing is transmitting.
     if(app->last_rssi < RAW_RSSI_SQUELCH_DBM) return;
 
-    RawCapture* rc = (app->scene == SceneCapture1) ? &app->raw1 : &app->raw2;
+    RawCapture* rc = &app->raws[app->capture_index];
     if(rc->count < RAW_MAX_SAMPLES) {
         rc->timing[rc->count] = level ? (int32_t)duration : -(int32_t)duration;
         rc->count++;
@@ -566,18 +896,55 @@ static void on_subghz_decode(SubGhzReceiver* receiver, SubGhzProtocolDecoderBase
 
     const SubGhzProtocol* protocol = decoder_base->protocol;
 
-    // Auto freq: any decode at all means there's a remote on this frequency.
-    if(app->scene == SceneAutoFreq) {
-        char fb[24];
-        freq_str(app->frequency, fb, sizeof(fb));
-        snprintf(app->auto_found_msg, sizeof(app->auto_found_msg), "%s on %s",
-                 protocol->name ? protocol->name : "Signal", fb);
-        app->pending_auto_found = true;
+    if(app->scene == SceneWatchdogLearn && app->armed) {
+        snprintf(app->watch_ref_name, sizeof(app->watch_ref_name), "%s", protocol->name ? protocol->name : "?");
+        app->watch_ref_type = (uint8_t)protocol->type;
+        app->watch_ref_hash = 0;
+        if(protocol->decoder && protocol->decoder->get_hash_data) {
+            app->watch_ref_hash = protocol->decoder->get_hash_data(decoder_base);
+        }
+        app->watch_freq = app->frequency;
+        app->watch_has_ref = true;
+        app->armed = false;
+        app->meter_boost = 1.0f;
+        notification_message(app->notifications, &sequence_single_vibro);
+        // Deferred to the timer thread — same reason as pending_finish above.
+        app->pending_watchdog_learned = true;
+        app_redraw(app);
         return;
     }
 
-    if((app->scene == SceneCapture1 || app->scene == SceneCapture2) && app->armed) {
-        CaptureResult* slot = (app->scene == SceneCapture1) ? &app->cap1 : &app->cap2;
+    if(app->scene == SceneWatching) {
+        bool is_known;
+        uint8_t hash = 0;
+        if(protocol->decoder && protocol->decoder->get_hash_data) {
+            hash = protocol->decoder->get_hash_data(decoder_base);
+        }
+        bool name_match = protocol->name && strcmp(protocol->name, app->watch_ref_name) == 0;
+        if(protocol->type == SubGhzProtocolTypeDynamic) {
+            // Rolling codes legitimately change hash every press — protocol
+            // family match is the best we can do here.
+            is_known = name_match;
+        } else {
+            is_known = name_match && (hash == app->watch_ref_hash);
+        }
+
+        if(is_known) app->watch_known_count++; else app->watch_unknown_count++;
+        app->meter_boost = 1.0f;
+        notification_message(app->notifications, is_known ? &sequence_single_vibro : &sequence_double_vibro);
+
+        // Logging is Storage I/O — defer it to the timer thread rather than
+        // doing file writes from inside the worker thread's callback.
+        app->pending_watchdog_event = true;
+        app->pending_watchdog_event_known = is_known;
+        snprintf(app->pending_watchdog_event_name, sizeof(app->pending_watchdog_event_name),
+                 "%s", protocol->name ? protocol->name : "?");
+        app_redraw(app);
+        return;
+    }
+
+    if(app->scene == SceneCapturing && app->armed && app->capture_index < app->capture_count) {
+        CaptureResult* slot = &app->caps[app->capture_index];
 
         snprintf(slot->name, sizeof(slot->name), "%s", protocol->name ? protocol->name : "?");
         slot->type = (uint8_t)protocol->type;
@@ -587,13 +954,16 @@ static void on_subghz_decode(SubGhzReceiver* receiver, SubGhzProtocolDecoderBase
         }
         slot->valid = true;
         app->armed = false;
+        app->meter_boost = 1.0f;
 
         notification_message(app->notifications, &sequence_single_vibro);
 
-        if(app->scene == SceneCapture1) {
-            app->scene    = SceneCapture2;
+        app->capture_index++;
+        if(app->capture_index < app->capture_count) {
             app->deadline = furi_get_tick() + furi_ms_to_ticks(CAPTURE_TIMEOUT_MS);
-            set_status(app, "Got sig 1 — arm for sig 2", 2000);
+            char msg[32];
+            snprintf(msg, sizeof(msg), "Got %u/%u — arm next", app->capture_index, app->capture_count);
+            set_status(app, msg, 1800);
         } else {
             // Deferred to the timer thread — subghz_rx_stop() can't run
             // from inside this callback (see App.pending_finish above).
@@ -607,20 +977,59 @@ static void on_subghz_decode(SubGhzReceiver* receiver, SubGhzProtocolDecoderBase
 // TIMEOUTS
 // ============================================================================
 
+// Begin the alignment-search Comparing scene: capture_count-1 pairs, each
+// vs raws[0], with the per-pair offset range scaled down as capture_count
+// grows so total analysis time stays roughly constant.
+static void start_comparing(App* app) {
+    uint16_t pair_count = app->capture_count - 1;
+    if(pair_count < 1) pair_count = 1;
+
+    uint32_t total_offsets = (uint32_t)(RAW_COMPARE_MAX_OFFSET * 2 + 1) * pair_count;
+    uint16_t per_tick = (uint16_t)(total_offsets / RAW_COMPARE_TARGET_TICKS);
+    if(per_tick < 4) per_tick = 4; // floor so the baseline (2 captures) case isn't slower than before
+
+    app->compare_pair_idx        = 0;
+    app->compare_pair_count      = pair_count;
+    app->compare_max_offset      = RAW_COMPARE_MAX_OFFSET;
+    app->compare_offset          = -RAW_COMPARE_MAX_OFFSET;
+    app->compare_offsets_per_tick = per_tick;
+    app->compare_done_total      = 0;
+    app->compare_total_all       = (uint16_t)(total_offsets > 0xFFFF ? 0xFFFF : total_offsets);
+    app->compare_pair_best       = 0.0f;
+    app->compare_min_score       = 1.0f;
+    app->compare_progress        = 0;
+    app->scene = SceneComparing;
+}
+
 static void process_timeouts(App* app) {
     uint32_t now = furi_get_tick();
 
     if(app->scene == SceneComparing) {
-        for(int i = 0; i < RAW_COMPARE_OFFSETS_PER_TICK && app->compare_offset <= RAW_COMPARE_MAX_OFFSET; i++) {
-            float score = raw_similarity_at_offset(&app->raw1, &app->raw2, app->compare_offset);
-            if(score > app->compare_best_score) app->compare_best_score = score;
-            app->compare_offset++;
-            app->compare_done++;
-        }
-        app->compare_progress = (uint8_t)((app->compare_done * 100U) / RAW_COMPARE_TOTAL_OFFSETS);
+        for(int i = 0; i < app->compare_offsets_per_tick && app->compare_pair_idx < app->compare_pair_count; i++) {
+            RawCapture* ref = &app->raws[0];
+            RawCapture* cur = &app->raws[app->compare_pair_idx + 1];
+            float score = raw_similarity_at_offset(ref, cur, app->compare_offset);
+            if(score > app->compare_pair_best) app->compare_pair_best = score;
 
-        if(app->compare_offset > RAW_COMPARE_MAX_OFFSET) {
-            float score = app->compare_best_score;
+            app->compare_offset++;
+            app->compare_done_total++;
+
+            if(app->compare_offset > app->compare_max_offset) {
+                if(app->compare_pair_best < app->compare_min_score) {
+                    app->compare_min_score = app->compare_pair_best;
+                }
+                app->compare_pair_idx++;
+                app->compare_offset = -app->compare_max_offset;
+                app->compare_pair_best = 0.0f;
+            }
+        }
+
+        app->compare_progress = app->compare_total_all
+            ? (uint8_t)((app->compare_done_total * 100U) / app->compare_total_all)
+            : 100;
+
+        if(app->compare_pair_idx >= app->compare_pair_count) {
+            float score = app->compare_min_score;
             Verdict v;
             if(score >= 0.90f)      v = VerdictFixed;
             else if(score <= 0.72f) v = VerdictRolling;
@@ -638,10 +1047,28 @@ static void process_timeouts(App* app) {
         return;
     }
 
+    if(app->pending_watchdog_learned) {
+        app->pending_watchdog_learned = false;
+        subghz_rx_stop(app);
+        app->force_decode_mode = false;
+        watchdog_save_ref(app);
+        app->scene = SceneWatchdogMenu;
+        char msg[40];
+        snprintf(msg, sizeof(msg), "Learned: %s", app->watch_ref_name);
+        set_status(app, msg, 2000);
+        app_redraw(app);
+        return;
+    }
+
+    if(app->pending_watchdog_event) {
+        app->pending_watchdog_event = false;
+        watchdog_log_event(app->pending_watchdog_event_known, app->pending_watchdog_event_name);
+        // Watching continues indefinitely — no scene change, no radio stop.
+    }
+
     if(app->pending_auto_found) {
         app->pending_auto_found = false;
         set_status(app, app->auto_found_msg, 3000);
-        app->auto_found = true;
         subghz_rx_stop(app);
         app->scene = SceneMenu;
         notification_message(app->notifications, &sequence_single_vibro);
@@ -649,30 +1076,34 @@ static void process_timeouts(App* app) {
         return;
     }
 
-    if((app->scene == SceneCapture1 || app->scene == SceneCapture2) && app->armed) {
-        // Read-Raw-Only: no decode event marks end of a press, so use a
-        // gap of silence after the last edge instead.
-        if(app->mode == ModeReadRawOnly) {
-            if(app->device) {
-                app->last_rssi = subghz_devices_get_rssi(app->device);
-            }
-            RawCapture* rc = (app->scene == SceneCapture1) ? &app->raw1 : &app->raw2;
+    if(app->scene == SceneCapturing && app->armed) {
+        if(app->device) {
+            app->last_rssi = subghz_devices_get_rssi(app->device);
+            if(app->last_rssi > RAW_RSSI_SQUELCH_DBM) app->meter_boost = 1.0f;
+        }
+
+        // Read-Raw-Only / Identifier: no decode event marks end of a press,
+        // so use a gap of silence after the last edge instead.
+        if((app->mode == ModeReadRawOnly || app->mode == ModeIdentifier) && app->raws) {
+            RawCapture* rc = &app->raws[app->capture_index];
             if(rc->count >= RAW_MIN_SAMPLES &&
                (int32_t)(now - rc->last_edge_tick) > (int32_t)furi_ms_to_ticks(RAW_SILENCE_MS)) {
                 rc->valid = true;
                 app->armed = false;
                 notification_message(app->notifications, &sequence_single_vibro);
 
-                if(app->scene == SceneCapture1) {
-                    app->scene    = SceneCapture2;
+                app->capture_index++;
+                if(app->capture_index < app->capture_count) {
                     app->deadline = now + furi_ms_to_ticks(CAPTURE_TIMEOUT_MS);
-                    set_status(app, "Got sig 1 — arm for sig 2", 2000);
+                    char msg[32];
+                    snprintf(msg, sizeof(msg), "Got %u/%u — arm next", app->capture_index, app->capture_count);
+                    set_status(app, msg, 1800);
                 } else {
-                    app->scene              = SceneComparing;
-                    app->compare_offset     = -RAW_COMPARE_MAX_OFFSET;
-                    app->compare_done       = 0;
-                    app->compare_best_score = 0.0f;
-                    app->compare_progress   = 0;
+                    if(app->mode == ModeIdentifier) {
+                        identifier_measure(app, &app->raws[0]);
+                        identifier_lookup(app);
+                    }
+                    start_comparing(app);
                 }
                 app_redraw(app);
                 return;
@@ -686,31 +1117,17 @@ static void process_timeouts(App* app) {
     }
 
     if(app->scene == SceneAutoFreq) {
-        if((int32_t)(now - app->auto_deadline) >= 0) {
-            subghz_rx_stop(app);
-            app->auto_idx++;
+        if(app->device) {
+            app->last_rssi = subghz_devices_get_rssi(app->device);
+            if(app->last_rssi > RAW_RSSI_SQUELCH_DBM) app->meter_boost = 1.0f;
+        }
 
-            // Skip any hardware-invalid freqs — passing them to the device
-            // layer would crash.
-            while(app->auto_idx < FREQ_PRESET_COUNT &&
-                  !freq_is_hardware_valid(kFreqPresets[app->auto_idx])) {
-                app->auto_idx++;
-            }
-
-            if(app->auto_idx >= FREQ_PRESET_COUNT) {
-                set_status(app, "No signal found", 2500);
-                app->scene = SceneMenu;
-                app_redraw(app);
-                return;
-            }
-
-            if(!subghz_rx_start(app, kFreqPresets[app->auto_idx])) {
-                // Couldn't start this one — skip it next tick
-                app->auto_deadline = furi_get_tick(); // expire immediately
-            } else {
-                app->auto_deadline = furi_get_tick() + furi_ms_to_ticks(AUTO_FREQ_DWELL_MS);
-            }
-            app_redraw(app);
+        // Auto-hop through the presets unless the user has grabbed manual
+        // control with Left/Right.
+        if(!app->auto_manual && (int32_t)(now - app->auto_deadline) >= 0) {
+            app->auto_preset_idx = (app->auto_preset_idx + 1) % (uint8_t)FREQ_PRESET_COUNT;
+            subghz_rx_start(app, kFreqPresets[app->auto_preset_idx]);
+            app->auto_deadline = now + furi_ms_to_ticks(AUTO_FREQ_DWELL_MS);
         }
     }
 }
@@ -728,6 +1145,12 @@ static void timer_cb(void* ctx) {
     // Expire status banner
     if(app->status[0] && !status_alive(app)) app->status[0] = '\0';
 
+    // Decay the signal-ball pulse envelope
+    if(app->meter_boost > 0.0f) {
+        app->meter_boost -= 0.15f;
+        if(app->meter_boost < 0.0f) app->meter_boost = 0.0f;
+    }
+
     process_timeouts(app);
     app_redraw(app);
 }
@@ -737,7 +1160,7 @@ static void timer_cb(void* ctx) {
 // ============================================================================
 
 // Shared header: fills black, draws title in BigNumbers, draws content frame
-static void draw_header(Canvas* canvas, const char* title) {
+static void draw_header_h(Canvas* canvas, const char* title, uint8_t frame_height) {
     canvas_set_color(canvas, ColorBlack);
     canvas_draw_box(canvas, 0, 0, 128, 64);
 
@@ -745,7 +1168,11 @@ static void draw_header(Canvas* canvas, const char* title) {
     canvas_set_font(canvas, FontBigNumbers);
     canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, title);
 
-    canvas_draw_frame(canvas, 2, 20, 124, 33);
+    canvas_draw_frame(canvas, 2, 20, 124, frame_height);
+}
+
+static void draw_header(Canvas* canvas, const char* title) {
+    draw_header_h(canvas, title, 33);
 }
 
 static void draw_footer(Canvas* canvas, const char* text) {
@@ -763,6 +1190,27 @@ static void anim_dots(uint32_t tick, const char* prefix, char* buf, size_t sz) {
     else            snprintf(buf, sz, "%s . . .", prefix);
 }
 
+// Signal strength indicator: a small ball with spikes that grow with the
+// boost envelope (pulses outward whenever a signal crosses squelch).
+static void draw_signal_ball(Canvas* canvas, int cx, int cy, float boost) {
+    // 6 petals, 60 degrees apart — a rounded spark rather than a spiky mine.
+    static const float dirs[6][2] = {
+        {1.0f, 0.0f},    {0.5f, 0.8660f},  {-0.5f, 0.8660f},
+        {-1.0f, 0.0f},   {-0.5f, -0.8660f}, {0.5f, -0.8660f},
+    };
+    const int center_r = 2;
+    const int petal_r = 2;
+    int reach = 4 + (int)(boost * 4.0f);
+
+    canvas_draw_disc(canvas, cx, cy, center_r);
+    for(int i = 0; i < 6; i++) {
+        int tipx = cx + (int)(dirs[i][0] * (float)reach);
+        int tipy = cy + (int)(dirs[i][1] * (float)reach);
+        canvas_draw_line(canvas, cx, cy, tipx, tipy);
+        canvas_draw_disc(canvas, tipx, tipy, petal_r);
+    }
+}
+
 // ============================================================================
 // DRAW: MENU
 // ============================================================================
@@ -777,6 +1225,7 @@ static void draw_menu(App* app, Canvas* canvas) {
         "Compare Signals",
         "Auto Find Freq",
         "Set Frequency",
+        "Watchdog",
         "Settings",
         "Toggle Radio",
         "About",
@@ -870,25 +1319,41 @@ static void draw_freq_select(App* app, Canvas* canvas) {
         canvas_draw_box(canvas, 124, by, 2, th);
     }
 
-    draw_footer(canvas, "OK=Select  [!]=blocked");
+    if(status_alive(app)) draw_footer(canvas, app->status);
 }
 
 // ============================================================================
 // DRAW: SETTINGS
 // ============================================================================
 
+#define SETTINGS_ROW_COUNT (CAPTURE_MODE_COUNT + 1) // 4 modes + Captures row
+
 static void draw_settings(App* app, Canvas* canvas) {
     draw_header(canvas, "Config");
 
-    canvas_set_font(canvas, FontPrimary);
     canvas_set_color(canvas, ColorWhite);
+    canvas_set_font(canvas, FontPrimary);
 
-    static const char* labels[3] = {"Decoder", "Bin Raw", "Read Raw Only"};
+    static const char* mode_labels[CAPTURE_MODE_COUNT] = {"Decoder", "Bin Raw", "Read Raw Only", "Identifier"};
+
+    int8_t start = (int8_t)app->settings_sel - 1;
+    if(start < 0) start = 0;
+    if(start > (int8_t)SETTINGS_ROW_COUNT - 3) start = (int8_t)SETTINGS_ROW_COUNT - 3;
+    if(start < 0) start = 0;
 
     for(int i = 0; i < 3; i++) {
-        uint8_t y = 31 + (uint8_t)(i * 10);
-        bool sel = (i == app->settings_sel);
-        bool active = ((CaptureMode)i == app->mode);
+        int idx = start + i;
+        if(idx >= SETTINGS_ROW_COUNT) break;
+        uint8_t y = 29 + (uint8_t)(i * 10);
+        bool sel = (idx == (int)app->settings_sel);
+
+        char line[28];
+        if(idx < CAPTURE_MODE_COUNT) {
+            bool active = ((CaptureMode)idx == app->mode);
+            snprintf(line, sizeof(line), "%s %s", active ? "[x]" : "[ ]", mode_labels[idx]);
+        } else {
+            snprintf(line, sizeof(line), "Captures [%u]", (unsigned)app->capture_count);
+        }
 
         if(sel) {
             canvas_draw_box(canvas, 3, y - 8, 122, 10);
@@ -896,22 +1361,24 @@ static void draw_settings(App* app, Canvas* canvas) {
         } else {
             canvas_set_color(canvas, ColorWhite);
         }
-
-        char line[28];
-        snprintf(line, sizeof(line), "%s %s", active ? "[x]" : "[ ]", labels[i]);
         canvas_draw_str(canvas, 6, y, line);
         canvas_set_color(canvas, ColorWhite);
     }
 
-    draw_footer(canvas, "OK=Enable  BACK=Menu");
+    // Feedback goes in the footer only — same pattern as the main menu —
+    // so the rows never disappear or get covered.
+    if(status_alive(app)) {
+        draw_footer(canvas, app->status);
+    }
 }
 
 // ============================================================================
-// DRAW: CAPTURE 1 / 2
+// DRAW: CAPTURING
 // ============================================================================
 
-static void draw_capture(App* app, Canvas* canvas) {
-    const char* title = (app->scene == SceneCapture1) ? "Sig 1" : "Sig 2";
+static void draw_capturing(App* app, Canvas* canvas) {
+    char title[10];
+    snprintf(title, sizeof(title), "Sig %u", (unsigned)(app->capture_index + 1));
     draw_header(canvas, title);
 
     canvas_set_font(canvas, FontPrimary);
@@ -923,7 +1390,6 @@ static void draw_capture(App* app, Canvas* canvas) {
         canvas_draw_str(canvas, 6, 32, anim);
 
         canvas_set_font(canvas, FontSecondary);
-        // Countdown bar
         uint32_t now = furi_get_tick();
         int32_t left_ms = (int32_t)furi_ms_to_ticks(CAPTURE_TIMEOUT_MS) -
                           (int32_t)(now - (app->deadline - furi_ms_to_ticks(CAPTURE_TIMEOUT_MS)));
@@ -941,12 +1407,13 @@ static void draw_capture(App* app, Canvas* canvas) {
         canvas_draw_str(canvas, 6, 43, "Press remote to arm");
     }
 
-    // Radio + step info
+    draw_signal_ball(canvas, 112, 27, app->meter_boost);
+
     canvas_set_font(canvas, FontSecondary);
     char radio[48];
-    snprintf(radio, sizeof(radio), "%s  %s/%u",
+    snprintf(radio, sizeof(radio), "%s  %u/%u",
              app->radio_name[0] ? app->radio_name : "?",
-             app->scene == SceneCapture1 ? "1" : "2", 2U);
+             (unsigned)(app->capture_index + 1), (unsigned)app->capture_count);
     draw_footer(canvas, radio);
 }
 
@@ -982,27 +1449,135 @@ static void draw_comparing(App* app, Canvas* canvas) {
 // ============================================================================
 
 static void draw_auto_freq(App* app, Canvas* canvas) {
-    draw_header(canvas, "Auto");
+    draw_header_h(canvas, "Auto", 38);
 
     canvas_set_color(canvas, ColorWhite);
+    canvas_set_font(canvas, FontSecondary);
+
+    char rssi_line[24];
+    snprintf(rssi_line, sizeof(rssi_line), "%d dBm", (int)app->last_rssi);
+    canvas_draw_str_aligned(canvas, 64, 23, AlignCenter, AlignTop, rssi_line);
+
+    draw_signal_ball(canvas, 64, 38, app->meter_boost);
+
+    // Bottom strip — Left/Right steps through the same presets as
+    // Set Frequency, and immediately re-tunes to whichever is shown.
+    // Up hands control back to the automatic sweep.
+    char fb[24];
+    freq_str(kFreqPresets[app->auto_preset_idx], fb, sizeof(fb));
+    char strip[32];
+    snprintf(strip, sizeof(strip), "< %s >", fb);
+    canvas_draw_str_aligned(canvas, 64, 49, AlignCenter, AlignTop, strip);
+
+    if(status_alive(app)) draw_footer(canvas, app->status);
+}
+
+// ============================================================================
+// DRAW: WATCHDOG MENU
+// ============================================================================
+
+static void draw_watchdog_menu(App* app, Canvas* canvas) {
+    draw_header(canvas, "Watch");
+
     canvas_set_font(canvas, FontPrimary);
+    canvas_set_color(canvas, ColorWhite);
+
+    static const char* labels[4] = {"Start Watching", "Learn Remote", "View Log", "Clear Log"};
+
+    for(int i = 0; i < 4; i++) {
+        uint8_t y = 29 + (uint8_t)(i * 8);
+        bool sel = (i == app->watchdog_menu_sel);
+        if(sel) {
+            canvas_draw_box(canvas, 3, y - 7, 122, 9);
+            canvas_set_color(canvas, ColorBlack);
+        } else {
+            canvas_set_color(canvas, ColorWhite);
+        }
+        canvas_draw_str(canvas, 6, y, labels[i]);
+        canvas_set_color(canvas, ColorWhite);
+    }
+
+    if(status_alive(app)) {
+        draw_footer(canvas, app->status);
+    } else if(app->watch_has_ref) {
+        char line[32];
+        snprintf(line, sizeof(line), "Ref: %s", app->watch_ref_name);
+        draw_footer(canvas, line);
+    } else {
+        draw_footer(canvas, "No reference learned yet");
+    }
+}
+
+// ============================================================================
+// DRAW: WATCHDOG LEARN (single capture, reused arm/listen visuals)
+// ============================================================================
+
+static void draw_watchdog_learn(App* app, Canvas* canvas) {
+    draw_header(canvas, "Learn");
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_set_color(canvas, ColorWhite);
+
+    if(app->armed) {
+        char anim[24];
+        anim_dots(app->tick, "> Listening", anim, sizeof(anim));
+        canvas_draw_str(canvas, 6, 32, anim);
+    } else {
+        canvas_draw_str(canvas, 6, 32, "  Ready");
+    }
+
+    draw_signal_ball(canvas, 112, 27, app->meter_boost);
+
+    if(status_alive(app)) draw_footer(canvas, app->status);
+}
+
+// ============================================================================
+// DRAW: WATCHING (continuous monitor)
+// ============================================================================
+
+static void draw_watching(App* app, Canvas* canvas) {
+    draw_header(canvas, "Watch");
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_set_font(canvas, FontSecondary);
 
     char anim[28];
-    char fb[18];
-    freq_str(app->frequency, fb, sizeof(fb));
-    char prefix[24];
-    snprintf(prefix, sizeof(prefix), "> %.14s", fb);
-    anim_dots(app->tick, prefix, anim, sizeof(anim));
-    canvas_draw_str(canvas, 6, 32, anim);
+    anim_dots(app->tick, "> Watching", anim, sizeof(anim));
+    canvas_draw_str(canvas, 6, 28, anim);
 
+    char ref_line[32];
+    snprintf(ref_line, sizeof(ref_line), "Ref: %s", app->watch_ref_name);
+    canvas_draw_str(canvas, 6, 37, ref_line);
+
+    char count_line[32];
+    snprintf(count_line, sizeof(count_line), "Known:%lu Unknown:%lu",
+             (unsigned long)app->watch_known_count, (unsigned long)app->watch_unknown_count);
+    canvas_draw_str(canvas, 6, 46, count_line);
+
+    draw_signal_ball(canvas, 112, 28, app->meter_boost);
+
+    if(status_alive(app)) draw_footer(canvas, app->status);
+}
+
+// ============================================================================
+// DRAW: WATCHDOG LOG
+// ============================================================================
+
+static void draw_watchdog_log(App* app, Canvas* canvas) {
+    draw_header(canvas, "Log");
+
+    canvas_set_color(canvas, ColorWhite);
     canvas_set_font(canvas, FontSecondary);
-    char prog[24];
-    snprintf(prog, sizeof(prog), "%lu/%lu freqs",
-             (unsigned long)(app->auto_idx + 1),
-             (unsigned long)FREQ_PRESET_COUNT);
-    canvas_draw_str(canvas, 6, 44, prog);
 
-    draw_footer(canvas, "Press remote  BACK=cancel");
+    if(app->log_line_count == 0) {
+        canvas_draw_str_aligned(canvas, 64, 36, AlignCenter, AlignCenter, "No events logged yet");
+    } else {
+        for(uint8_t i = 0; i < app->log_line_count; i++) {
+            canvas_draw_str(canvas, 4, 27 + (uint8_t)(i * 8), app->log_lines[i]);
+        }
+    }
+
+    draw_footer(canvas, "Showing most recent");
 }
 
 // ============================================================================
@@ -1015,7 +1590,6 @@ static void draw_result(App* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorWhite);
     canvas_set_font(canvas, FontPrimary);
 
-    // Big verdict line — invert for emphasis
     const char* vtext;
     switch(app->verdict) {
     case VerdictFixed:      vtext = "FIXED CODE";    break;
@@ -1027,7 +1601,6 @@ static void draw_result(App* app, Canvas* canvas) {
     default:                vtext = "UNKNOWN";       break;
     }
 
-    // Filled box for verdict
     canvas_draw_box(canvas, 3, 21, 122, 12);
     canvas_set_color(canvas, ColorBlack);
     canvas_draw_str_aligned(canvas, 64, 27, AlignCenter, AlignCenter, vtext);
@@ -1039,24 +1612,29 @@ static void draw_result(App* app, Canvas* canvas) {
     char conf_line[40];
     uint8_t pct = (uint8_t)(app->confidence * 100.0f);
 
-    if(app->mode == ModeReadRawOnly) {
-        snprintf(proto_line, sizeof(proto_line), "Raw samples: %u / %u",
-                 app->raw1.count, app->raw2.count);
+    if(app->mode == ModeIdentifier) {
+        if(app->ident_has_match) {
+            snprintf(proto_line, sizeof(proto_line), "Match: %s", app->ident_match_name);
+        } else {
+            snprintf(proto_line, sizeof(proto_line), "Te:%luus Edges:%u",
+                     (unsigned long)app->ident_te_us, (unsigned)app->ident_edge_count);
+        }
+        snprintf(conf_line, sizeof(conf_line), "Confidence: %u%%", (unsigned)pct);
+    } else if(app->mode == ModeReadRawOnly) {
+        snprintf(proto_line, sizeof(proto_line), "Raw presses: %u", (unsigned)app->capture_count);
         snprintf(conf_line, sizeof(conf_line), "Confidence: %u%%", (unsigned)pct);
     } else {
-        if(app->cap1.valid) {
-            snprintf(proto_line, sizeof(proto_line), "Protocol: %s", app->cap1.name);
+        if(app->caps[0].valid) {
+            snprintf(proto_line, sizeof(proto_line), "Protocol: %s", app->caps[0].name);
         } else {
             snprintf(proto_line, sizeof(proto_line), "Protocol: unrecognized");
         }
-        snprintf(conf_line, sizeof(conf_line), "Confidence: %u%%  Hash %02X/%02X",
-                 (unsigned)pct, app->cap1.hash, app->cap2.hash);
+        snprintf(conf_line, sizeof(conf_line), "Confidence: %u%%  (%u presses)",
+                 (unsigned)pct, (unsigned)app->capture_count);
     }
     canvas_draw_str(canvas, 6, 40, proto_line);
     canvas_draw_str(canvas, 6, 50, conf_line);
 
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 4, 63, AlignLeft, AlignBottom, "BACK=Menu");
     canvas_draw_str_aligned(canvas, 124, 63, AlignRight, AlignBottom, "Re-scan >");
 }
 
@@ -1090,15 +1668,18 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(!app) return;
 
     switch(app->scene) {
-    case SceneMenu:       draw_menu(app, canvas);       break;
-    case SceneFreqSelect: draw_freq_select(app, canvas); break;
-    case SceneSettings:   draw_settings(app, canvas);    break;
-    case SceneCapture1:
-    case SceneCapture2:   draw_capture(app, canvas);    break;
-    case SceneComparing:  draw_comparing(app, canvas);  break;
-    case SceneAutoFreq:   draw_auto_freq(app, canvas);  break;
-    case SceneResult:     draw_result(app, canvas);     break;
-    case SceneAbout:      draw_about(canvas);            break;
+    case SceneMenu:          draw_menu(app, canvas);          break;
+    case SceneFreqSelect:    draw_freq_select(app, canvas);   break;
+    case SceneSettings:      draw_settings(app, canvas);      break;
+    case SceneCapturing:     draw_capturing(app, canvas);     break;
+    case SceneComparing:     draw_comparing(app, canvas);     break;
+    case SceneAutoFreq:      draw_auto_freq(app, canvas);     break;
+    case SceneResult:        draw_result(app, canvas);        break;
+    case SceneAbout:         draw_about(canvas);              break;
+    case SceneWatchdogMenu:  draw_watchdog_menu(app, canvas); break;
+    case SceneWatchdogLearn: draw_watchdog_learn(app, canvas); break;
+    case SceneWatching:      draw_watching(app, canvas);      break;
+    case SceneWatchdogLog:   draw_watchdog_log(app, canvas);  break;
     }
 }
 
@@ -1130,17 +1711,19 @@ static void input_cb(InputEvent* ev, void* ctx) {
             case MenuAutoFreq:   start_auto_freq(app);              break;
             case MenuFreqSelect:
                 app->freq_sel = 0;
-                // Pre-select the closest preset to current freq
                 for(uint8_t i = 0; i < FREQ_PRESET_COUNT; i++) {
                     if(kFreqPresets[i] == app->frequency) { app->freq_sel = i; break; }
                 }
                 app->scene = SceneFreqSelect;
                 app_redraw(app);
                 break;
+            case MenuWatchdog:
+                app->watchdog_menu_sel = 0;
+                app->scene = SceneWatchdogMenu;
+                app_redraw(app);
+                break;
             case MenuRadioToggle:
                 app->use_external = !app->use_external;
-                // Releasing here forces the next capture to re-acquire
-                // (begin) whichever device is selected.
                 device_release(app);
                 set_status(app, app->use_external ? "Radio: External" : "Radio: Internal", 1500);
                 app_redraw(app);
@@ -1197,21 +1780,54 @@ static void input_cb(InputEvent* ev, void* ctx) {
     if(app->scene == SceneSettings) {
         if(ev->key == InputKeyBack) { app->scene = SceneMenu; app_redraw(app); return; }
         if(ev->key == InputKeyUp) {
-            app->settings_sel = (app->settings_sel == 0) ? 2 : app->settings_sel - 1;
+            app->settings_sel = (app->settings_sel == 0) ? (uint8_t)(SETTINGS_ROW_COUNT - 1) : app->settings_sel - 1;
             app_redraw(app);
             return;
         }
         if(ev->key == InputKeyDown) {
-            app->settings_sel = (app->settings_sel + 1) % 3;
+            app->settings_sel = (app->settings_sel + 1) % SETTINGS_ROW_COUNT;
             app_redraw(app);
             return;
         }
-        if(ev->key == InputKeyOk) {
+
+        if(app->settings_sel == CAPTURE_MODE_COUNT) {
+            if(ev->key == InputKeyLeft) {
+                if(app->capture_count <= MIN_CAPTURES) {
+                    notification_message(app->notifications, &sequence_single_vibro);
+                    set_status(app, "Minimum captures!", 1400);
+                } else {
+                    app->capture_count--;
+                    settings_save(app);
+                    char msg[24];
+                    snprintf(msg, sizeof(msg), "Captures: %u", (unsigned)app->capture_count);
+                    set_status(app, msg, 1200);
+                }
+                app_redraw(app);
+                return;
+            }
+            if(ev->key == InputKeyRight) {
+                if(app->capture_count >= MAX_CAPTURES) {
+                    notification_message(app->notifications, &sequence_single_vibro);
+                    set_status(app, "Maximum captures!", 1400);
+                } else {
+                    app->capture_count++;
+                    settings_save(app);
+                    char msg[24];
+                    snprintf(msg, sizeof(msg), "Captures: %u", (unsigned)app->capture_count);
+                    set_status(app, msg, 1200);
+                }
+                app_redraw(app);
+                return;
+            }
+        }
+
+        if(ev->key == InputKeyOk && app->settings_sel != CAPTURE_MODE_COUNT) {
             app->mode = (CaptureMode)app->settings_sel;
             settings_save(app);
             const char* mode_name =
                 app->mode == ModeDecoder ? "Decoder" :
-                app->mode == ModeBinRaw  ? "Bin Raw" : "Read Raw Only";
+                app->mode == ModeBinRaw  ? "Bin Raw" :
+                app->mode == ModeReadRawOnly ? "Read Raw Only" : "Identifier";
             char msg[32];
             snprintf(msg, sizeof(msg), "Mode: %s", mode_name);
             set_status(app, msg, 1800);
@@ -1221,18 +1837,21 @@ static void input_cb(InputEvent* ev, void* ctx) {
         return;
     }
 
-    // --- CAPTURE 1 / 2 ---
-    if(app->scene == SceneCapture1 || app->scene == SceneCapture2) {
+    // --- CAPTURING ---
+    if(app->scene == SceneCapturing) {
         if(ev->key == InputKeyBack) {
             subghz_rx_stop(app);
             go_menu(app);
             app_redraw(app);
             return;
         }
-        // OK arms the capture window.
         if(ev->key == InputKeyOk && !app->armed) {
             subghz_receiver_reset(app->receiver);
-            app->last_rssi = -120.0f; // squelch closed until the next RSSI poll
+            // Read RSSI immediately rather than leaving a stale "squelch
+            // closed" sentinel — a pulse arriving before the next 40ms
+            // timer tick would otherwise get silently dropped even on a
+            // strong signal, causing an intermittent empty capture.
+            app->last_rssi = app->device ? subghz_devices_get_rssi(app->device) : -120.0f;
             app->armed    = true;
             app->deadline = furi_get_tick() + furi_ms_to_ticks(CAPTURE_TIMEOUT_MS);
             notification_message(app->notifications, &sequence_single_vibro);
@@ -1253,9 +1872,115 @@ static void input_cb(InputEvent* ev, void* ctx) {
 
     // --- AUTO FREQ ---
     if(app->scene == SceneAutoFreq) {
-        if(ev->key == InputKeyBack || ev->key == InputKeyOk) {
-            subghz_rx_stop(app);
+        if(ev->key == InputKeyBack) {
+            app->frequency = app->pre_scan_freq;
             go_menu(app);
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyUp) {
+            app->auto_manual = false;
+            app->auto_deadline = furi_get_tick() + furi_ms_to_ticks(AUTO_FREQ_DWELL_MS);
+            set_status(app, "Auto", 1000);
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyLeft) {
+            app->auto_manual = true;
+            app->auto_preset_idx = (app->auto_preset_idx == 0)
+                ? (uint8_t)(FREQ_PRESET_COUNT - 1)
+                : app->auto_preset_idx - 1;
+            subghz_rx_start(app, kFreqPresets[app->auto_preset_idx]);
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyRight) {
+            app->auto_manual = true;
+            app->auto_preset_idx = (app->auto_preset_idx + 1) % (uint8_t)FREQ_PRESET_COUNT;
+            subghz_rx_start(app, kFreqPresets[app->auto_preset_idx]);
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyOk) {
+            app->frequency = kFreqPresets[app->auto_preset_idx];
+            char fb[24]; freq_str(app->frequency, fb, sizeof(fb));
+            char msg[40]; snprintf(msg, sizeof(msg), "Locked: %s", fb);
+            set_status(app, msg, 2000);
+            go_menu(app);
+            app_redraw(app);
+        }
+        return;
+    }
+
+    // --- WATCHDOG MENU ---
+    if(app->scene == SceneWatchdogMenu) {
+        if(ev->key == InputKeyBack) { app->scene = SceneMenu; app_redraw(app); return; }
+        if(ev->key == InputKeyUp) {
+            app->watchdog_menu_sel = (app->watchdog_menu_sel == 0) ? 3 : app->watchdog_menu_sel - 1;
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyDown) {
+            app->watchdog_menu_sel = (app->watchdog_menu_sel + 1) % 4;
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyOk) {
+            switch(app->watchdog_menu_sel) {
+            case 0: start_watching(app); break;
+            case 1: start_watchdog_learn(app); break;
+            case 2:
+                watchdog_log_load_recent(app);
+                app->scene = SceneWatchdogLog;
+                app_redraw(app);
+                break;
+            case 3:
+                watchdog_log_clear();
+                app->log_line_count = 0;
+                set_status(app, "Log cleared", 1500);
+                app_redraw(app);
+                break;
+            default: break;
+            }
+        }
+        return;
+    }
+
+    // --- WATCHDOG LEARN ---
+    if(app->scene == SceneWatchdogLearn) {
+        if(ev->key == InputKeyBack) {
+            subghz_rx_stop(app);
+            app->force_decode_mode = false;
+            app->scene = SceneWatchdogMenu;
+            app_redraw(app);
+            return;
+        }
+        if(ev->key == InputKeyOk && !app->armed) {
+            subghz_receiver_reset(app->receiver);
+            app->last_rssi = app->device ? subghz_devices_get_rssi(app->device) : -120.0f;
+            app->armed    = true;
+            app->deadline = furi_get_tick() + furi_ms_to_ticks(CAPTURE_TIMEOUT_MS);
+            notification_message(app->notifications, &sequence_single_vibro);
+            app_redraw(app);
+        }
+        return;
+    }
+
+    // --- WATCHING ---
+    if(app->scene == SceneWatching) {
+        if(ev->key == InputKeyBack) {
+            subghz_rx_stop(app);
+            app->force_decode_mode = false;
+            app->scene = SceneWatchdogMenu;
+            app_redraw(app);
+        }
+        return;
+    }
+
+    // --- WATCHDOG LOG ---
+    if(app->scene == SceneWatchdogLog) {
+        if(ev->key == InputKeyBack || ev->key == InputKeyOk) {
+            app->scene = SceneWatchdogMenu;
             app_redraw(app);
         }
         return;
@@ -1312,6 +2037,9 @@ static void app_free(App* app) {
     if(app->environment) {
         subghz_environment_free(app->environment);
     }
+    if(app->raws) {
+        free(app->raws);
+    }
 
     if(app->view_port) {
         view_port_free(app->view_port);
@@ -1347,10 +2075,11 @@ int32_t rolling_code_checker_app(void* p) {
     app->gui           = furi_record_open(RECORD_GUI);
 
     settings_load(app);
+    watchdog_load_ref(app);
 
-    // Set up the decode pipeline: environment (protocol registry) ->
-    // receiver (matches pulses against every registered protocol) ->
-    // worker (feeds raw CC1101 pulses into the receiver on its own thread).
+    // Decode pipeline: environment (protocol registry) -> receiver (matches
+    // pulses against every registered protocol) -> worker (feeds raw CC1101
+    // pulses into the receiver on its own thread).
     app->environment = subghz_environment_alloc();
     subghz_environment_set_protocol_registry(app->environment, (void*)&subghz_protocol_registry);
 
